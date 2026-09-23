@@ -55,7 +55,7 @@ from sympy.matrices import Matrix, MatrixSymbol, SparseMatrix
 from sympy.printing.codeprinter import PrintMethodNotImplementedError
 from sympy.printing.lambdarepr import LambdaPrinter
 from sympy.printing.numpy import NumPyPrinter
-from sympy.utilities.lambdify import implemented_function, lambdastr
+from sympy.utilities.lambdify import implemented_function, lambdastr, lambdify_precheck
 from sympy.testing.pytest import skip
 from sympy.external.mpmath import conserve_mpmath_dps
 from sympy.utilities.exceptions import ignore_warnings
@@ -2331,3 +2331,286 @@ def test_issue_28803_jointrandonsymbol_recursion():
 
     # Should not raise RecursionError
     lambdify(a, z * a)
+
+
+# --- lambdify_precheck ------------------------------------------------------
+
+
+class _ExplodingMapping:
+    """Stand-in for a user implementation that the precheck must not call."""
+
+    def __call__(self, *args):
+        raise AssertionError(
+            "lambdify_precheck must not call user provided functions")
+
+
+def _precheck_piecewise_expr():
+    # The besselj case is never taken on "ordinary" inputs below 1.
+    return Piecewise((sin(x), x < 1), (besselj(0, x), True))
+
+
+def test_lambdify_precheck_supported():
+    result = lambdify_precheck(sin(x) + cos(x), modules='math')
+    assert result.backend == 'math'
+    assert result.all_supported
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.functions['cos']['status'] == 'supported'
+    assert result.functions['sin']['provider'] == 'math'
+    assert result.unsupported == []
+    assert result.unknown == []
+
+
+def test_lambdify_precheck_piecewise_inspects_every_case_math():
+    expr = _precheck_piecewise_expr()
+    result = lambdify_precheck(expr, modules='math')
+
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.functions['besselj']['status'] == 'unsupported'
+    assert result.functions['sin']['top_level'] is False
+    assert result.functions['sin']['branches'] == [(0, 0)]
+    assert result.functions['besselj']['branches'] == [(0, 1)]
+    assert 'function:besselj' in result.unsupported
+
+    branch = result.branches[0]
+    assert branch['kind'] == 'Piecewise'
+    assert branch['status'] == 'supported'
+    assert branch['evaluation'] == 'lazy'
+    assert branch['cases'][0]['condition'] == 'x < 1'
+    assert branch['cases'][0]['requirements'] == ['function:sin']
+    assert branch['cases'][1]['unsupported'] == ['besselj']
+
+    # The math backend is lazy: common inputs work, the other case does not.
+    f = lambdify(x, expr, modules='math')
+    assert f(0) == 0.0
+    raises(NameError, lambda: f(2))
+
+
+def test_lambdify_precheck_piecewise_numpy_eager():
+    if not numpy:
+        skip("numpy not installed.")
+    expr = _precheck_piecewise_expr()
+    result = lambdify_precheck(expr, modules='numpy')
+
+    assert result.functions['besselj']['status'] == 'unsupported'
+    assert result.operations['less']['status'] == 'supported'
+    assert result.operations['select']['status'] == 'supported'
+
+    branch = result.branches[0]
+    assert branch['evaluation'] == 'eager'
+    assert branch['construct'] == 'numpy.select'
+    assert branch['cases'][1]['unsupported'] == ['besselj']
+
+    # numpy evaluates every case, so even inputs selecting the first case
+    # reveal the missing function.
+    f = lambdify(x, expr, modules='numpy')
+    raises(NameError, lambda: f(numpy.array([0.0])))
+
+
+def test_lambdify_precheck_scipy_maps_special_functions():
+    if not scipy:
+        skip("scipy not installed.")
+    result = lambdify_precheck(_precheck_piecewise_expr(),
+                               modules=['numpy', 'scipy'])
+    assert result.backend == 'scipy'
+    assert result.functions['besselj']['status'] == 'supported'
+    assert result.all_supported
+
+
+def test_lambdify_precheck_ite_numpy():
+    if not numpy:
+        skip("numpy not installed.")
+    expr = ITE(x > 0, sin(x) > 0, besselj(0, x) > 1)
+    result = lambdify_precheck(expr, modules='numpy')
+
+    branch = result.branches[0]
+    assert branch['kind'] == 'ITE'
+    assert branch['evaluation'] == 'eager'
+    assert branch['cases'][0]['requirements'] == ['function:sin']
+    assert branch['cases'][1]['unsupported'] == ['besselj']
+    assert result.functions['besselj']['status'] == 'unsupported'
+
+
+def test_lambdify_precheck_nested_piecewise():
+    if not numpy:
+        skip("numpy not installed.")
+    expr = Piecewise(
+        (Piecewise((sin(x), x > 1), (besselj(0, x), True)), x > 0),
+        (cos(x), True))
+    result = lambdify_precheck(expr, modules='numpy')
+
+    assert len(result.branches) == 2
+    assert result.branches[0]['evaluation'] == 'eager'
+    assert result.functions['sin']['branches'] == [(0, 0, 1, 0)]
+    assert result.functions['besselj']['branches'] == [(0, 0, 1, 1)]
+    assert result.functions['cos']['branches'] == [(0, 1)]
+    assert result.branches[1]['cases'][1]['unsupported'] == ['besselj']
+
+
+def test_lambdify_precheck_user_mapping_priority():
+    # An opaque user mapping listed first wins over the backend mapping but
+    # cannot be verified statically.
+    result = lambdify_precheck(
+        sin(x), modules=[{'sin': lambda value: value}, 'math'])
+    assert result.functions['sin']['status'] == 'unknown'
+    assert 'user-provided mapping #0' in result.functions['sin']['provider']
+
+    # A later user mapping loses to the backend (earlier entries win).
+    result = lambdify_precheck(
+        sin(x), modules=['math', {'sin': lambda value: value}])
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.functions['sin']['provider'] == 'math'
+
+    if numpy:
+        # A user mapping that is just the backend's own function is verified.
+        result = lambdify_precheck(
+            sin(x), modules=[{'sin': numpy.sin}, 'numpy'])
+        assert result.functions['sin']['status'] == 'supported'
+
+        # A user mapping can cover a function that the backend lacks, but an
+        # opaque callable is still reported as unknown.
+        result = lambdify_precheck(
+            besselj(0, x), modules=[{'besselj': lambda *args: 0}, 'numpy'])
+        assert result.functions['besselj']['status'] == 'unknown'
+        assert 'function:besselj' in result.unknown
+
+
+def test_lambdify_precheck_does_not_call_user_functions():
+    exploder = _ExplodingMapping()
+
+    # Inside a case that common inputs would never take.
+    expr = Piecewise((sin(x), x < 0), (besselj(0, x), True))
+    result = lambdify_precheck(expr, modules=[{'besselj': exploder}, 'math'])
+    assert result.functions['besselj']['status'] == 'unknown'
+
+    # Implementations attached through implemented_function are not called.
+    h = implemented_function(Function('h'), exploder)
+    result = lambdify_precheck(h(x), modules='math')
+    assert result.functions['h']['status'] == 'unknown'
+
+
+def test_lambdify_precheck_implemented_function():
+    g = implemented_function(Function('g'), lambda value: value + 1)
+
+    result = lambdify_precheck(g(x), modules='math')
+    assert result.functions['g']['status'] == 'unknown'
+    assert result.functions['g']['provider'] == \
+        'implemented function (_imp_)'
+
+    result = lambdify_precheck(
+        g(x), args=[x], modules='math', use_imps=False)
+    assert result.functions['g']['status'] == 'unsupported'
+
+
+def test_lambdify_precheck_undefined_function():
+    f = Function('f')
+
+    # Without the lambda arguments it cannot be known that f is bound.
+    result = lambdify_precheck(f(x) + 1, modules='math')
+    assert result.functions['f']['status'] == 'unknown'
+
+    # f supplied as a lambda argument.
+    result = lambdify_precheck(f(x) + 1, args=[f(x)], modules='math')
+    assert result.functions['f']['status'] == 'argument'
+    assert 'function:f' not in result.unsupported
+
+    # Arguments supplied, but f is not one of them.
+    result = lambdify_precheck(f(x) + 1, args=[x], modules='math')
+    assert result.functions['f']['status'] == 'unsupported'
+
+    # f provided through a user mapping.
+    result = lambdify_precheck(
+        f(x) + 1, modules=[{'f': lambda value: value + 1}, 'math'])
+    assert result.functions['f']['status'] == 'unknown'
+
+
+def test_lambdify_precheck_constants():
+    result = lambdify_precheck(pi + E + I, modules='math')
+    assert result.constants['Pi']['status'] == 'supported'
+    assert result.constants['Exp1']['status'] == 'supported'
+    assert result.constants['ImaginaryUnit']['status'] == 'supported'
+    assert result.all_supported
+
+    result = lambdify_precheck(S.GoldenRatio, modules='mpmath')
+    assert result.constants['GoldenRatio']['status'] == 'supported'
+    assert result.constants['GoldenRatio']['provider'] == 'mpmath'
+
+    if numpy:
+        result = lambdify_precheck(pi + E + S.EulerGamma, modules='numpy')
+        assert result.constants['Pi']['status'] == 'supported'
+        assert result.constants['Exp1']['status'] == 'supported'
+        assert result.constants['EulerGamma']['status'] == 'supported'
+        assert result.all_supported
+
+
+def test_lambdify_precheck_numexpr():
+    if not numexpr:
+        skip("numexpr not installed.")
+
+    result = lambdify_precheck(sin(x) + asin(x), modules='numexpr')
+    assert result.backend == 'numexpr'
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.functions['asin']['status'] == 'supported'
+
+    expr = _precheck_piecewise_expr()
+    result = lambdify_precheck(expr, modules='numexpr')
+    assert result.branches[0]['evaluation'] == 'eager'
+    assert result.functions['besselj']['status'] == 'unsupported'
+
+    # numexpr inlines _imp_ implementations, which must not be called by the
+    # precheck; they are reported as unknown instead.
+    h = implemented_function(Function('h'), _ExplodingMapping())
+    result = lambdify_precheck(h(x), modules='numexpr')
+    assert result.functions['h']['status'] == 'unknown'
+
+    result = lambdify_precheck(sin(h(x)), modules='numexpr')
+    assert result.functions['h']['status'] == 'unknown'
+    assert not result.all_supported
+
+
+def test_lambdify_precheck_operations_numpy():
+    if not numpy:
+        skip("numpy not installed.")
+    result = lambdify_precheck(Eq(x, 1), modules='numpy')
+    assert result.operations['equal']['status'] == 'supported'
+    assert result.all_supported
+
+
+def test_lambdify_precheck_nested_expressions():
+    exprs = [sin(x), Piecewise((1, x > 0), (besselj(0, x), True))]
+    result = lambdify_precheck(exprs, modules='math')
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.functions['besselj']['status'] == 'unsupported'
+    assert result.branches[0]['cases'][1]['unsupported'] == ['besselj']
+
+
+def test_lambdify_precheck_default_modules():
+    result = lambdify_precheck(sin(x))
+    assert result.functions['sin']['status'] == 'supported'
+    assert result.all_supported
+
+
+def test_lambdify_precheck_matrix_symbol_argument():
+    if not numpy:
+        skip("numpy not installed.")
+    M = MatrixSymbol('M', 2, 2)
+
+    # Without arguments the free matrix symbol might be a lambda argument.
+    result = lambdify_precheck(M + M, modules='numpy')
+    assert result.operations['M']['status'] == 'unknown'
+
+    # Supplied as an argument.
+    result = lambdify_precheck(M + M, args=[M], modules='numpy')
+    assert result.all_supported
+
+    # Arguments given, but M is not one of them.
+    result = lambdify_precheck(M + M, args=[x], modules='numpy')
+    assert result.operations['M']['status'] == 'unsupported'
+
+
+def test_lambdify_precheck_repr():
+    result = lambdify_precheck(
+        _precheck_piecewise_expr(), modules='math')
+    text = repr(result)
+    assert "'math' backend" in text
+    assert 'besselj: unsupported' in text
+    assert 'Piecewise #0' in text

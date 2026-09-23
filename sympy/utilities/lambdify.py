@@ -7,10 +7,13 @@ from __future__ import annotations
 from typing import Any
 
 import builtins
+import importlib
 import inspect
+import io
 import keyword
 import textwrap
 import linecache
+import tokenize
 import weakref
 
 # Required despite static analysis claiming it is not used
@@ -821,39 +824,12 @@ def lambdify(args, expr, modules=None, printer=None, use_imps=True,
 
     # If the user hasn't specified any modules, use what is available.
     if modules is None:
-        try:
-            _import("scipy")
-        except ImportError:
-            try:
-                _import("numpy")
-            except ImportError:
-                # Use either numpy (if available) or python.math where possible.
-                # XXX: This leads to different behaviour on different systems and
-                #      might be the reason for irreproducible errors.
-                modules = ["math", "mpmath", "sympy"]
-            else:
-                modules = ["numpy"]
-        else:
-            modules = ["numpy", "scipy"]
+        modules = _default_modules()
 
     # Get the needed namespaces.
-    namespaces = []
-    # First find any function implementations
-    if use_imps:
-        namespaces.append(_imp_namespace(expr))
-    # Check for dict before iterating
-    if isinstance(modules, (dict, str)) or not hasattr(modules, '__iter__'):
-        namespaces.append(modules)
-    else:
-        # consistency check
-        if _module_present('numexpr', modules) and len(modules) > 1:
-            raise TypeError("numexpr must be the only item in 'modules'")
-        namespaces += list(modules)
+    namespaces = _collect_namespaces(expr, modules, use_imps)
     # fill namespace with first having highest priority
-    namespace = {}
-    for m in namespaces[::-1]:
-        buf = _get_namespace(m)
-        namespace.update(buf)
+    namespace = _merge_namespaces(namespaces)
 
     if hasattr(expr, "atoms"):
         #Try if you can extract symbols from the expression.
@@ -863,35 +839,8 @@ def lambdify(args, expr, modules=None, printer=None, use_imps=True,
             namespace.update({str(term): term})
 
     if printer is None:
-        if _module_present('mpmath', namespaces):
-            from sympy.printing.pycode import MpmathPrinter as Printer # type: ignore
-        elif _module_present('scipy', namespaces):
-            from sympy.printing.numpy import SciPyPrinter as Printer # type: ignore
-        elif _module_present('numpy', namespaces):
-            from sympy.printing.numpy import NumPyPrinter as Printer # type: ignore
-        elif _module_present('unumpy', namespaces):
-            from sympy.printing.numpy import NumPyPrinter as Printer # type: ignore
-        elif _module_present('cupy', namespaces):
-            from sympy.printing.numpy import CuPyPrinter as Printer # type: ignore
-        elif _module_present('jax', namespaces):
-            from sympy.printing.numpy import JaxPrinter as Printer # type: ignore
-        elif _module_present('numexpr', namespaces):
-            from sympy.printing.lambdarepr import NumExprPrinter as Printer # type: ignore
-        elif _module_present('tensorflow', namespaces):
-            from sympy.printing.tensorflow import TensorflowPrinter as Printer # type: ignore
-        elif _module_present('torch', namespaces):
-            from sympy.printing.pytorch import TorchPrinter as Printer  # type: ignore
-        elif _module_present('sympy', namespaces):
-            from sympy.printing.pycode import SymPyPrinter as Printer # type: ignore
-        elif _module_present('cmath', namespaces):
-            from sympy.printing.pycode import CmathPrinter as Printer # type: ignore
-        else:
-            from sympy.printing.pycode import PythonCodePrinter as Printer # type: ignore
-        user_functions = {}
-        for m in namespaces[::-1]:
-            if isinstance(m, dict):
-                for k in m:
-                    user_functions[k] = k
+        Printer = _select_printer_class(namespaces)
+        user_functions = _user_functions_from_namespaces(namespaces)
         printer = Printer({'fully_qualified_modules': False, 'inline': True,
                            'allow_unknown_functions': True,
                            'user_functions': user_functions})
@@ -1025,6 +974,94 @@ def _get_namespace(m):
         return m.__dict__
     else:
         raise TypeError("Argument must be either a string, dict or module but it is: %s" % m)
+
+
+def _default_modules():
+    """Select the default ``modules`` list used when ``modules`` is not given."""
+    try:
+        _import("scipy")
+    except ImportError:
+        try:
+            _import("numpy")
+        except ImportError:
+            # Use either numpy (if available) or python.math where possible.
+            # XXX: This leads to different behaviour on different systems and
+            #      might be the reason for irreproducible errors.
+            return ["math", "mpmath", "sympy"]
+        else:
+            return ["numpy"]
+    else:
+        return ["numpy", "scipy"]
+
+
+def _collect_namespaces(expr, modules, use_imps):
+    """Build the prioritized list of namespace specs used by ``lambdify``.
+
+    Entries appearing earlier in the returned list have higher priority. The
+    implementations attached to functions through ``_imp_`` end up first when
+    *use_imps* is true.
+    """
+    namespaces = []
+    # First find any function implementations
+    if use_imps:
+        namespaces.append(_imp_namespace(expr))
+    # Check for dict before iterating
+    if isinstance(modules, (dict, str)) or not hasattr(modules, '__iter__'):
+        namespaces.append(modules)
+    else:
+        # consistency check
+        if _module_present('numexpr', modules) and len(modules) > 1:
+            raise TypeError("numexpr must be the only item in 'modules'")
+        namespaces += list(modules)
+    return namespaces
+
+
+def _merge_namespaces(namespaces):
+    """Merge the namespace specs, with the first one having highest priority."""
+    namespace = {}
+    for m in namespaces[::-1]:
+        namespace.update(_get_namespace(m))
+    return namespace
+
+
+def _select_printer_class(namespaces):
+    """Select the code printer class matching the (highest priority) module."""
+    if _module_present('mpmath', namespaces):
+        from sympy.printing.pycode import MpmathPrinter as Printer # type: ignore
+    elif _module_present('scipy', namespaces):
+        from sympy.printing.numpy import SciPyPrinter as Printer # type: ignore
+    elif _module_present('numpy', namespaces):
+        from sympy.printing.numpy import NumPyPrinter as Printer # type: ignore
+    elif _module_present('unumpy', namespaces):
+        from sympy.printing.numpy import NumPyPrinter as Printer # type: ignore
+    elif _module_present('cupy', namespaces):
+        from sympy.printing.numpy import CuPyPrinter as Printer # type: ignore
+    elif _module_present('jax', namespaces):
+        from sympy.printing.numpy import JaxPrinter as Printer # type: ignore
+    elif _module_present('numexpr', namespaces):
+        from sympy.printing.lambdarepr import NumExprPrinter as Printer # type: ignore
+    elif _module_present('tensorflow', namespaces):
+        from sympy.printing.tensorflow import TensorflowPrinter as Printer # type: ignore
+    elif _module_present('torch', namespaces):
+        from sympy.printing.pytorch import TorchPrinter as Printer  # type: ignore
+    elif _module_present('sympy', namespaces):
+        from sympy.printing.pycode import SymPyPrinter as Printer # type: ignore
+    elif _module_present('cmath', namespaces):
+        from sympy.printing.pycode import CmathPrinter as Printer # type: ignore
+    else:
+        from sympy.printing.pycode import PythonCodePrinter as Printer # type: ignore
+    return Printer
+
+
+def _user_functions_from_namespaces(namespaces):
+    """Collect the user defined function names passed in as dictionaries."""
+    user_functions = {}
+    for m in namespaces[::-1]:
+        if isinstance(m, dict):
+            for k in m:
+                user_functions[k] = k
+    return user_functions
+
 
 
 def _recursive_to_string(doprint, arg):
@@ -1628,3 +1665,878 @@ def _too_large_for_docstring(expr, limit):
         if i > limit:
             return True
     return False
+
+
+# Status values reported by lambdify_precheck
+PRECHECK_SUPPORTED = "supported"
+PRECHECK_UNSUPPORTED = "unsupported"
+PRECHECK_UNKNOWN = "unknown"
+PRECHECK_ARGUMENT = "argument"
+
+_PRECHECK_STATUS_RANK = {
+    PRECHECK_SUPPORTED: 0,
+    PRECHECK_ARGUMENT: 0,
+    PRECHECK_UNKNOWN: 1,
+    PRECHECK_UNSUPPORTED: 2,
+}
+
+
+class LambdifyPrecheckResult:
+    """Report returned by :func:`lambdify_precheck`.
+
+    Attributes
+    ==========
+
+    backend : str
+        Label of the backend the selected printer targets (for instance
+        ``"numpy"`` or ``"math"``).
+    functions : dict
+        Maps each function used by the expression to an entry describing the
+        status. An entry has the keys:
+
+        ``status``
+            One of ``"supported"``, ``"unsupported"``, ``"unknown"`` and
+            ``"argument"`` (the latter for undefined functions that are
+            supplied as lambda arguments).
+        ``names``
+            Maps each bare name that the generated code would look up to a
+            ``(status, provider)`` pair.
+        ``provider``
+        Comma separated list of the namespace sources providing the needed
+        names.
+        ``top_level``
+            Whether the function is used outside of any ``Piecewise``/``ITE``
+            branch.
+        ``branches``
+            Locations (``(branch id, case index)`` pairs) in which the
+            function is used, including branches that are not taken on common
+            inputs.
+    constants : dict
+        Like ``functions`` but for symbolic constants (``pi``, ``E``, ...).
+    operations : dict
+        Additional bare names that the generated code would look up but that
+        are not emitted as a function or constant entry (for example
+        ``less`` or ``equal`` used to print relational operators). Each value
+        carries ``status`` and ``provider`` keys.
+    branches : list
+        One entry per ``Piecewise`` or ``ITE`` occurrence. Each entry records
+        the construct the backend would emit (``construct``), whether all
+        cases are evaluated eagerly or lazily (``evaluation``), the status of
+        the branch construct, and the requirements appearing in each case.
+        Eager backends (such as NumPy) evaluate every case, so a requirement
+        missing from a rarely taken case still fails.
+    failed_imports : list
+        ``(module, name)`` pairs that the printer would import but that the
+        backend does not actually provide.
+    print_error : tuple or None
+        If the whole expression cannot be printed, a ``(status, message)``
+        pair describing why.
+
+    """
+    def __init__(self, backend, functions, constants, branches, *,
+                 operations=(), failed_imports=(), print_error=None):
+        self.backend = backend
+        self.functions = functions
+        self.constants = constants
+        self.operations = dict(operations)
+        self.branches = branches
+        self.failed_imports = list(failed_imports)
+        self.print_error = print_error
+
+    @staticmethod
+    def _problems(mapping, category):
+        problems = []
+        for name, entry in mapping.items():
+            if entry['status'] in (PRECHECK_UNSUPPORTED, PRECHECK_UNKNOWN):
+                problems.append((entry['status'], '%s:%s' % (category, name)))
+        return problems
+
+    def _all_problems(self):
+        problems = self._problems(self.functions, 'function')
+        problems += self._problems(self.constants, 'constant')
+        problems += self._problems(self.operations, 'operation')
+        for branch in self.branches:
+            if branch['status'] in (PRECHECK_UNSUPPORTED, PRECHECK_UNKNOWN):
+                problems.append((branch['status'],
+                                 'branch:%d' % branch['id']))
+        for mod, name in self.failed_imports:
+            problems.append((PRECHECK_UNSUPPORTED,
+                             'import:%s.%s' % (mod, name)))
+        if self.print_error is not None:
+            problems.append((self.print_error[0], 'expression'))
+        return problems
+
+    @property
+    def unsupported(self):
+        """Sorted labels of requirements that are provably not mappable."""
+        return sorted(label for status, label in self._all_problems()
+                      if status == PRECHECK_UNSUPPORTED)
+
+    @property
+    def unknown(self):
+        """Sorted labels whose mappability cannot be decided statically."""
+        return sorted(label for status, label in self._all_problems()
+                      if status == PRECHECK_UNKNOWN)
+
+    @property
+    def all_supported(self):
+        """Whether every requirement was verified as mappable."""
+        return not self._all_problems()
+
+    def __repr__(self):
+        lines = ['lambdify precheck for the %r backend' % self.backend]
+        for title, mapping in (('functions', self.functions),
+                               ('constants', self.constants),
+                               ('operations', self.operations)):
+            if not mapping:
+                continue
+            lines.append('%s:' % title)
+            for name in sorted(mapping):
+                entry = mapping[name]
+                suffix = (' (%s)' % entry['provider']) if entry.get('provider') else ''
+                note = ''
+                if entry['status'] in (PRECHECK_UNSUPPORTED, PRECHECK_UNKNOWN) \
+                        and entry.get('note'):
+                    note = ' - %s' % entry['note']
+                lines.append('  %s: %s%s%s' %
+                             (name, entry['status'], suffix, note))
+        for branch in self.branches:
+            lines.append('%s #%d: %s (%s, %s evaluation)' % (
+                branch['kind'], branch['id'], branch['status'],
+                branch['construct'], branch['evaluation']))
+        if self.failed_imports:
+            lines.append('failed imports: %s' %
+                         ', '.join('%s.%s' % pair for pair in self.failed_imports))
+        if self.print_error is not None:
+            lines.append('expression: %s - %s' % self.print_error)
+        return '\n'.join(lines)
+
+
+class _PrecheckFunctionPrinter:
+    """Adapter making a plain function printer usable by the precheck."""
+
+    def __init__(self, printer):
+        self._printer = printer
+        self.module_imports = {}
+
+    def doprint(self, expr):
+        return self._printer(expr)
+
+    def _print(self, expr):
+        return self._printer(expr)
+
+
+def lambdify_precheck(expr, modules=None, args=None, *, printer=None,
+                      use_imps=True):
+    """Statically check whether *expr* can be lambdified for a backend.
+
+    Explanation
+    ===========
+
+    ``lambdify`` only fails once the generated function is called and a
+    missing name is looked up. Expressions containing ``Piecewise`` (or
+    ``ITE``) are especially tricky because the cases that are not taken on
+    common inputs are still parsed by vectorized backends such as NumPy,
+    which evaluate every case. A function that is only used in such a case
+    therefore makes the generated function fail on inputs that never reach
+    that case.
+
+    This function performs the same namespace and printer setup as
+    :func:`lambdify` and then walks the whole expression tree -- including
+    every branch case -- without calling the generated function or any of
+    the user provided implementations. It reports, one by one, whether the
+    functions, constants and branch operations that the expression actually
+    needs can be mapped by the selected backend.
+
+    User provided mappings (dictionaries in *modules*, or implementations
+    attached through :func:`implemented_function`) take part with the same
+    priority as in :func:`lambdify`: an opaque user provided object makes the
+    requirement ``"unknown"``, because its compatibility with the backend
+    cannot be verified statically; it is never called.
+
+    Parameters
+    ==========
+
+    expr : Expr
+        The expression (or a nested list/tuple/dict of expressions) that
+        would be passed to :func:`lambdify`.
+    modules :
+        The same ``modules`` argument as accepted by :func:`lambdify`.
+    args : optional
+        The lambda arguments, as accepted by :func:`lambdify`. Undefined
+        functions appearing here are reported as ``"argument"`` instead of
+        being looked up in the backend namespace. If omitted, undefined
+        functions that cannot be resolved are reported as ``"unknown"``.
+    printer : optional
+        A custom printer, as accepted by :func:`lambdify`.
+    use_imps : bool, optional
+        Whether implementations attached through ``_imp_`` are taken into
+        account (highest priority), like in :func:`lambdify`.
+
+    Returns
+    =======
+
+    LambdifyPrecheckResult
+        Structured report. See :class:`LambdifyPrecheckResult`. The
+        convenience attributes ``all_supported``, ``unsupported`` and
+        ``unknown`` summarize the result.
+
+    Examples
+    ========
+
+    >>> from sympy import symbols, sin, besselj, Piecewise
+    >>> from sympy.utilities.lambdify import lambdify_precheck
+    >>> x = symbols('x')
+
+    The second case is inspected even though common inputs do not reach it:
+
+    >>> result = lambdify_precheck(
+    ...     Piecewise((sin(x), x < 1), (besselj(0, x), True)), modules='math')
+    >>> result.functions['besselj']['status']
+    'unsupported'
+    >>> result.branches[0]['evaluation']
+    'lazy'
+    >>> result.all_supported
+    False
+
+    A user provided mapping has priority over the backend mapping, but an
+    opaque implementation cannot be verified and is reported as unknown:
+
+    >>> result = lambdify_precheck(
+    ...     besselj(0, x), modules=[{'besselj': lambda *args: args}, 'math'])
+    >>> result.functions['besselj']['status']
+    'unknown'
+
+    Plain backends otherwise report everything as supported:
+
+    >>> from sympy import E, I, pi
+    >>> lambdify_precheck(pi + E + I, modules='math').all_supported
+    True
+
+    """
+    from sympy.core.basic import Basic
+    from sympy.core.function import (AppliedUndef, Application, Derivative,
+                                    Function)
+    from sympy.core.numbers import (ComplexInfinity, ImaginaryUnit, Infinity,
+                                    NaN, NegativeInfinity, NumberSymbol)
+    from sympy.core.symbol import Symbol
+    from sympy.concrete.summations import Sum
+    from sympy.functions.elementary.piecewise import Piecewise
+    from sympy.integrals.integrals import Integral
+    from sympy.logic.boolalg import ITE
+    from sympy.printing.codeprinter import (CodePrinter,
+                                            PrintMethodNotImplementedError)
+    from sympy.printing.lambdarepr import NumExprPrinter
+    from sympy.printing.numpy import NumPyPrinter, SciPyPrinter
+    from sympy.printing.pycode import (AbstractPythonCodePrinter, CmathPrinter,
+                                       MpmathPrinter, SymPyPrinter)
+    from sympy.printing.pytorch import TorchPrinter
+    from sympy.printing.tensorflow import TensorflowPrinter
+
+    if modules is None:
+        modules = _default_modules()
+    specs = _collect_namespaces(expr, modules, use_imps=False)
+    imp_namespace = _imp_namespace(expr) if use_imps else {}
+    namespaces = ([imp_namespace] if use_imps else []) + specs
+
+    # Symbols occurring in the expression are lambda inputs, not backend
+    # requirements.
+    bound_symbols = set()
+    if hasattr(expr, "atoms"):
+        for term in expr.atoms(Symbol):
+            bound_symbols.add(str(term))
+
+    # Matrix symbols (and similar named leaves) can also be passed as lambda
+    # arguments; without ``args`` their status cannot be decided statically.
+    from sympy.matrices.expressions import MatrixExpr
+    possible_inputs = set()
+    if hasattr(expr, "atoms"):
+        for term in expr.atoms(MatrixExpr):
+            name = str(term)
+            if isinstance(term, Basic) and name.isidentifier() \
+                    and not keyword.iskeyword(name):
+                possible_inputs.add(name)
+
+    bound_functions = set()
+    if args is not None:
+        _collect_bound_arguments(args, bound_symbols, bound_functions)
+
+    # Namespace sources in priority order, with the provenance of each name.
+    sources = []
+    if use_imps:
+        sources.append(("implemented function (_imp_)", "imp", imp_namespace))
+    for index, spec in enumerate(specs):
+        ns = _get_namespace(spec)
+        if isinstance(spec, dict):
+            label = "user-provided mapping #%d" % index
+            kind = "user"
+        elif isinstance(spec, str):
+            label, kind = spec, "backend"
+        else:
+            label, kind = getattr(spec, "__name__", "module"), "backend"
+        sources.append((label, kind, ns))
+
+    providers = {}
+    backend_values = {}
+    for label, kind, ns in sources:
+        for key, value in ns.items():
+            providers.setdefault(key, (label, kind, value))
+            if kind == "backend":
+                backend_values.setdefault(id(value), label)
+    # lambdify always adds these to the generated function's namespace.
+    providers.setdefault('builtins', ("builtins module", "backend", builtins))
+    providers.setdefault('range', ("Python builtin", "backend", range))
+
+    # Build the printer exactly like lambdify would.
+    if printer is None:
+        Printer = _select_printer_class(namespaces)
+        user_functions = _user_functions_from_namespaces(namespaces)
+        printer = Printer({'fully_qualified_modules': False, 'inline': True,
+                           'allow_unknown_functions': True,
+                           'user_functions': user_functions})
+    elif inspect.isclass(printer):
+        printer = printer()
+    elif inspect.isfunction(printer):
+        printer = _PrecheckFunctionPrinter(printer)
+
+    is_numexpr = isinstance(printer, NumExprPrinter)
+
+    def iter_nodes(node):
+        if isinstance(node, Basic):
+            yield node
+            for subnode in node.args:
+                yield from iter_nodes(subnode)
+        elif isinstance(node, (list, tuple)):
+            for subnode in node:
+                yield from iter_nodes(subnode)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                yield from iter_nodes(key)
+                yield from iter_nodes(value)
+
+    # NumExprPrinter inlines _imp_ implementations while printing, i.e. it
+    # would call the user provided implementation. Such functions are reported
+    # as unknown and their printing is skipped entirely.
+    numexpr_table = getattr(printer, '_numexpr_functions', {}) \
+        if is_numexpr else {}
+    inlined_user_imps = set()
+    if is_numexpr:
+        for node in iter_nodes(expr):
+            if isinstance(node, Function) \
+                    and type(node).__name__ not in numexpr_table \
+                    and getattr(getattr(node, 'func', None),
+                                '_imp_', None) is not None:
+                inlined_user_imps.add(type(node).__name__)
+
+    # Build the exact function string lambdify would generate (printing only
+    # produces strings; user provided numerical implementations are never
+    # called). This registers the module imports that lambdify would
+    # execute, and the signature names are known bound names.
+    print_error = None
+    printed = None
+    signature_names = set()
+    if inlined_user_imps:
+        print_error = (
+            PRECHECK_UNKNOWN,
+            "numexpr inlines the user provided implementation(s) of %s, "
+            "which cannot be verified statically"
+            % ', '.join(sorted(inlined_user_imps)))
+    else:
+        if args is None:
+            iterable_args = list(expr.atoms(Symbol)) \
+                if hasattr(expr, 'atoms') else []
+        elif isinstance(args, Basic):
+            iterable_args = (args,)
+        else:
+            iterable_args = args
+        try:
+            funcprinter = _EvaluatorPrinter(printer, dummify=False)
+            printed = funcprinter.doprint(
+                '_lambdifygenerated', iterable_args, expr)
+            signature = printed.split(':', 1)[0]
+            signature_names = _extract_identifiers(signature)
+            signature_names.discard('def')
+        except PrintMethodNotImplementedError as exc:
+            print_error = (PRECHECK_UNSUPPORTED, str(exc))
+        except NotImplementedError as exc:
+            print_error = (PRECHECK_UNSUPPORTED, str(exc))
+        except TypeError as exc:
+            severity = (PRECHECK_UNSUPPORTED if is_numexpr
+                        else PRECHECK_UNKNOWN)
+            print_error = (severity, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            print_error = (PRECHECK_UNKNOWN,
+                           '%s: %s' % (type(exc).__name__, exc))
+    bound_symbols |= signature_names
+
+    failed_imports = []
+    for mod, keys in (getattr(printer, 'module_imports', None) or {}).items():
+        try:
+            imported = importlib.import_module(mod)
+        except ImportError:
+            failed_imports.extend((mod, key) for key in keys)
+            continue
+        for key in keys:
+            if hasattr(imported, key):
+                providers.setdefault(
+                    key, ('%s (import)' % mod, "backend",
+                          getattr(imported, key)))
+            else:
+                failed_imports.append((mod, key))
+
+    def backend_label():
+        if is_numexpr:
+            return "numexpr"
+        if isinstance(printer, SciPyPrinter):
+            return "scipy"
+        if isinstance(printer, NumPyPrinter):
+            return getattr(printer, '_module', "numpy")
+        if isinstance(printer, TensorflowPrinter):
+            return "tensorflow"
+        if isinstance(printer, TorchPrinter):
+            return "torch"
+        if isinstance(printer, MpmathPrinter):
+            return "mpmath"
+        if isinstance(printer, SymPyPrinter):
+            return "sympy"
+        if isinstance(printer, CmathPrinter):
+            return "cmath"
+        if isinstance(printer, AbstractPythonCodePrinter):
+            for spec in specs:
+                if isinstance(spec, str):
+                    return spec
+                name = getattr(spec, '__name__', None)
+                if name:
+                    return name
+            return "python"
+        return type(printer).__name__
+
+    def branch_spec():
+        if is_numexpr:
+            return ("numexpr.where", "eager", PRECHECK_SUPPORTED)
+        if isinstance(printer, NumPyPrinter):
+            return ('%s.select' % getattr(printer, '_module', "numpy"),
+                    "eager", PRECHECK_SUPPORTED)
+        if isinstance(printer, TensorflowPrinter):
+            return ("tensorflow.where", "eager", PRECHECK_SUPPORTED)
+        if isinstance(printer, TorchPrinter):
+            return ("torch.where", "eager", PRECHECK_SUPPORTED)
+        if isinstance(printer, AbstractPythonCodePrinter):
+            return ("conditional expression (if/else)", "lazy",
+                    PRECHECK_SUPPORTED)
+        method = getattr(printer, '_print_Piecewise', None)
+        if method is None or \
+                getattr(method, '__func__', method) is CodePrinter._print_not_supported:
+            return (None, None, PRECHECK_UNSUPPORTED)
+        return ("custom piecewise printer", "unknown", PRECHECK_UNKNOWN)
+
+    def resolve_name(name, allow_compiler=False):
+        if name in bound_symbols:
+            return PRECHECK_ARGUMENT, "lambda argument"
+        provider = providers.get(name)
+        if provider is not None:
+            label, kind, value = provider
+            if kind == "backend":
+                return PRECHECK_SUPPORTED, label
+            if id(value) in backend_values:
+                return PRECHECK_SUPPORTED, '%s -> %s' % (
+                    label, backend_values[id(value)])
+            return PRECHECK_UNKNOWN, label
+        if hasattr(builtins, name):
+            return PRECHECK_SUPPORTED, "Python builtin"
+        if allow_compiler:
+            return PRECHECK_UNKNOWN, "numexpr expression compiler"
+        return PRECHECK_UNSUPPORTED, None
+
+    functions = {}
+    constants = {}
+    branches = []
+    function_like = (Function, Application, Derivative, Integral, Sum)
+    call_name_cache = {}
+
+    def print_node(node):
+        try:
+            text = printer._print(node)
+        except PrintMethodNotImplementedError as exc:
+            return None, (PRECHECK_UNSUPPORTED, str(exc))
+        except NotImplementedError as exc:
+            return None, (PRECHECK_UNSUPPORTED, str(exc))
+        except TypeError as exc:
+            severity = PRECHECK_UNSUPPORTED if is_numexpr else PRECHECK_UNKNOWN
+            return None, (severity, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return None, (PRECHECK_UNKNOWN,
+                          '%s: %s' % (type(exc).__name__, exc))
+        return text, None
+
+    def child_nodes(node):
+        if isinstance(node, Basic):
+            return list(node.args)
+        if isinstance(node, (list, tuple)):
+            return list(node)
+        if isinstance(node, dict):
+            return list(node.keys()) + list(node.values())
+        return []
+
+    def own_call_names(node):
+        """Call-position names emitted by *node* itself.
+
+        Calls emitted by function-like subexpressions of its arguments are
+        excluded: they are reported on their own entries.
+        """
+        if node in call_name_cache:
+            return call_name_cache[node]
+        if is_numexpr:
+            # Printing this node would print (and therefore inline-call) a
+            # descendant carrying a user provided _imp_ implementation.
+            for subnode in iter_nodes(node):
+                if isinstance(subnode, Function) \
+                        and type(subnode).__name__ not in numexpr_table \
+                        and getattr(getattr(subnode, 'func', None),
+                                    '_imp_', None) is not None:
+                    problem = (PRECHECK_UNKNOWN,
+                               "implemented_function inlined by numexpr")
+                    call_name_cache[node] = (set(), problem)
+                    return set(), problem
+        text, problem = print_node(node)
+        if problem is not None:
+            call_name_cache[node] = (set(), problem)
+            return set(), problem
+        nested = set()
+        stack = child_nodes(node)
+        seen = set()
+        while stack:
+            child = stack.pop()
+            if not isinstance(child, Basic) or id(child) in seen:
+                continue
+            seen.add(id(child))
+            if isinstance(child, function_like):
+                nested |= own_call_names(child)[0]
+            stack.extend(child_nodes(child))
+        names = _extract_identifiers(
+            text, calls_only=True,
+            bound=bound_symbols | bound_functions) - nested
+        call_name_cache[node] = (names, None)
+        return names, None
+
+    def record(bucket, key, ctx, *, status=None, names=None, note=None):
+        entry = bucket.get(key)
+        if entry is None:
+            entry = {
+                'status': PRECHECK_SUPPORTED,
+                'names': {},
+                'provider': '',
+                'note': None,
+                'top_level': False,
+                'branches': [],
+                '_statuses': set(),
+            }
+            bucket[key] = entry
+        if ctx:
+            if ctx not in entry['branches']:
+                entry['branches'].append(ctx)
+        else:
+            entry['top_level'] = True
+        if status is not None:
+            entry['_statuses'].add(status)
+        if note is not None and entry['note'] is None:
+            entry['note'] = note
+        for name, result in (names or {}).items():
+            previous = entry['names'].get(name)
+            if previous is None or \
+                    _PRECHECK_STATUS_RANK[result[0]] > _PRECHECK_STATUS_RANK[previous[0]]:
+                entry['names'][name] = result
+                entry['_statuses'].add(result[0])
+
+    def classify_names(names, allow_compiler=False):
+        results = {}
+        for name in sorted(names):
+            if name in bound_symbols:
+                continue
+            results[name] = resolve_name(name, allow_compiler)
+        return results
+
+    def handle_function(node, ctx):
+        key = type(node).__name__
+        if isinstance(node, AppliedUndef) and key in bound_functions:
+            record(functions, key, ctx, status=PRECHECK_ARGUMENT,
+                   note="supplied as a lambda argument")
+            return
+        if is_numexpr:
+            if key in numexpr_table:
+                emitted = numexpr_table[key]
+                record(functions, key, ctx, status=PRECHECK_SUPPORTED,
+                       names={emitted: (PRECHECK_SUPPORTED,
+                                        "numexpr built-in function")})
+                return
+            if getattr(getattr(node, 'func', None), '_imp_', None) is not None:
+                # numexpr inlines this implementation; printing it would call
+                # the user provided function.
+                record(functions, key, ctx, status=PRECHECK_UNKNOWN,
+                       note="implemented_function inlined by numexpr")
+                return
+        names, print_problem = own_call_names(node)
+        if print_problem is not None:
+            record(functions, key, ctx, status=print_problem[0],
+                   note=print_problem[1])
+            return
+        results = classify_names(names)
+        status = None
+        note = None
+        if isinstance(node, AppliedUndef):
+            own = results.pop(key, None)
+            if own is not None and own[0] != PRECHECK_UNSUPPORTED:
+                # The undefined function name resolves through a mapping.
+                results[key] = own
+            else:
+                # Not provided anywhere; it might still be supplied as a
+                # lambda argument, which cannot be known without ``args``.
+                status = (PRECHECK_UNKNOWN if args is None
+                          else PRECHECK_UNSUPPORTED)
+                note = ("undefined function; it must be supplied as a lambda "
+                        "argument or through a module mapping")
+        record(functions, key, ctx, status=status, names=results, note=note)
+
+    def handle_constant(node, ctx):
+        key = type(node).__name__
+        text, print_problem = print_node(node)
+        if print_problem is not None:
+            record(constants, key, ctx, status=print_problem[0],
+                   note=print_problem[1])
+            return
+        # A constant compiled into a literal (1j, float('inf'), inlined
+        # NumberSymbol) needs no namespace name and is always supported.
+        results = classify_names(
+            _extract_identifiers(text), allow_compiler=is_numexpr)
+        record(constants, key, ctx, names=results)
+
+    def walk(node, ctx=()):
+        if isinstance(node, Piecewise):
+            branch_id = len(branches)
+            construct, evaluation, status = branch_spec()
+            branches.append({
+                'id': branch_id,
+                'kind': 'Piecewise',
+                'construct': construct,
+                'evaluation': evaluation,
+                'status': status,
+                'cases': [{'index': i, 'condition': str(pair.cond)}
+                          for i, pair in enumerate(node.args)],
+            })
+            for i, pair in enumerate(node.args):
+                child_ctx = ctx + (branch_id, i)
+                walk(pair.expr, child_ctx)
+                walk(pair.cond, child_ctx)
+            return
+        if isinstance(node, ITE):
+            branch_id = len(branches)
+            construct, evaluation, status = branch_spec()
+            branches.append({
+                'id': branch_id,
+                'kind': 'ITE',
+                'construct': construct,
+                'evaluation': evaluation,
+                'status': status,
+                'cases': [
+                    {'index': 1, 'condition': str(node.args[0])},
+                    {'index': 2, 'condition': 'else'},
+                ],
+            })
+            walk(node.args[0], ctx + (branch_id, 1))
+            walk(node.args[1], ctx + (branch_id, 1))
+            walk(node.args[2], ctx + (branch_id, 2))
+            return
+        if isinstance(node, Basic):
+            if isinstance(node, function_like):
+                handle_function(node, ctx)
+            elif isinstance(node, (NumberSymbol, ImaginaryUnit, NaN,
+                                   Infinity, NegativeInfinity,
+                                   ComplexInfinity)):
+                handle_constant(node, ctx)
+            for subnode in node.args:
+                walk(subnode, ctx)
+        elif isinstance(node, (list, tuple)):
+            for subnode in node:
+                walk(subnode, ctx)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                walk(key, ctx)
+                walk(value, ctx)
+
+    walk(expr)
+
+    for bucket in (functions, constants):
+        for entry in bucket.values():
+            statuses = entry['_statuses']
+            if statuses:
+                entry['status'] = max(
+                    statuses, key=lambda s: _PRECHECK_STATUS_RANK[s])
+            entry['provider'] = ', '.join(sorted({
+                provider for result in entry['names'].values()
+                for provider in [result[1]] if provider}))
+            del entry['_statuses']
+
+    for branch in branches:
+        branch_id = branch['id']
+        requirements = []
+        for category, bucket in (('function', functions),
+                                 ('constant', constants)):
+            for name, entry in bucket.items():
+                cases = sorted({
+                    path[j + 1]
+                    for path in entry['branches']
+                    for j in range(0, len(path) - 1, 2)
+                    if path[j] == branch_id
+                })
+                if cases:
+                    requirements.append({
+                        'category': category,
+                        'name': name,
+                        'status': entry['status'],
+                        'cases': cases,
+                    })
+        for case in branch['cases']:
+            case_index = case['index']
+            case['requirements'] = [
+                '%s:%s' % (item['category'], item['name'])
+                for item in requirements if case_index in item['cases']
+            ]
+            case['unsupported'] = sorted(
+                item['name'] for item in requirements
+                if case_index in item['cases']
+                and item['status'] == PRECHECK_UNSUPPORTED)
+            case['unknown'] = sorted(
+                item['name'] for item in requirements
+                if case_index in item['cases']
+                and item['status'] == PRECHECK_UNKNOWN)
+        branch['unsupported'] = sorted({
+            item['name'] for item in requirements
+            if item['status'] == PRECHECK_UNSUPPORTED})
+        branch['unknown'] = sorted({
+            item['name'] for item in requirements
+            if item['status'] == PRECHECK_UNKNOWN})
+
+    # Safety net over the full generated function string: any bare name that
+    # would be looked up at runtime but was not attributed above (for example
+    # ``less``/``equal`` used by relational printing) is checked here.
+    operations = {}
+    if printed is not None:
+        attributed = set()
+        for bucket in (functions, constants):
+            for entry in bucket.values():
+                attributed.update(entry['names'])
+        unattributed = _extract_identifiers(printed, include_heads=True) \
+            - bound_symbols - bound_functions - attributed
+        for name in sorted(unattributed):
+            if name in possible_inputs:
+                status = (PRECHECK_UNKNOWN if args is None
+                          else PRECHECK_UNSUPPORTED)
+                provider = 'possible lambda argument' if args is None else ''
+            else:
+                status, provider = resolve_name(
+                    name, allow_compiler=is_numexpr)
+            operations[name] = {'status': status, 'provider': provider or ''}
+
+    return LambdifyPrecheckResult(
+        backend_label(), functions, constants, branches,
+        operations=operations, failed_imports=failed_imports,
+        print_error=print_error)
+
+
+def _collect_bound_arguments(args, bound_symbols, bound_functions):
+    """Collect symbol and undefined function names bound as lambda arguments."""
+    from sympy.core.basic import Basic
+    from sympy.core.function import (AppliedUndef, Derivative, Function,
+                                     UndefinedFunction)
+    from sympy.core.symbol import Symbol
+    from sympy.matrices import DeferredVector
+    from sympy.matrices.expressions import MatrixExpr
+
+    def rec(arg):
+        if inspect.isclass(arg) and isinstance(arg, UndefinedFunction):
+            bound_functions.add(arg.__name__)
+        elif isinstance(arg, DeferredVector):
+            bound_symbols.add(str(arg))
+        elif isinstance(arg, Basic):
+            if isinstance(arg, AppliedUndef):
+                bound_functions.add(arg.func.__name__)
+            if isinstance(arg, (Function, Derivative)):
+                bound_symbols.update(map(str, arg.atoms(Symbol)))
+            elif isinstance(arg, (Symbol, MatrixExpr)):
+                bound_symbols.add(str(arg))
+            for subarg in arg.args:
+                rec(subarg)
+        elif isinstance(arg, str):
+            bound_symbols.add(arg)
+        elif iterable(arg, exclude=(str, bytes)):
+            for subarg in arg:
+                rec(subarg)
+
+    if isinstance(args, (Basic, str)) or inspect.isclass(args) or \
+            not iterable(args, exclude=(str, bytes)):
+        rec(args)
+    else:
+        for arg in args:
+            rec(arg)
+
+
+def _extract_identifiers(code, calls_only=False, bound=(), include_heads=False):
+    """Return the bare identifiers referenced by a snippet of generated code.
+
+    Attribute names on either side of a dot, keywords, keyword argument names
+    and comprehension variables are excluded. When *calls_only* is true, only
+    identifiers used in call position (immediately followed by ``(``) are
+    returned, and names in *bound* are skipped. When *include_heads* is true,
+    the leading name of a dotted attribute access is also returned.
+    """
+    bound = set(bound)
+    ignored = {
+        tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+        tokenize.ENCODING, tokenize.COMMENT, tokenize.ENDMARKER,
+    }
+    try:
+        tokens = [token for token in
+                  tokenize.generate_tokens(io.StringIO(code).readline)
+                  if token.type not in ignored]
+    except tokenize.TokenError:
+        return set()
+
+    local_names = set()
+    i = 0
+    while i < len(tokens):
+        if tokens[i].type == tokenize.NAME and tokens[i].string == 'for':
+            j = i + 1
+            while j < len(tokens) and tokens[j].type != tokenize.NAME:
+                j += 1
+            while j < len(tokens) and tokens[j].string != 'in':
+                if tokens[j].type == tokenize.NAME:
+                    local_names.add(tokens[j].string)
+                j += 1
+        i += 1
+
+    names = set()
+    for i, token in enumerate(tokens):
+        if token.type != tokenize.NAME:
+            continue
+        name = token.string
+        if keyword.iskeyword(name) or name in local_names or name in bound:
+            continue
+        previous = tokens[i - 1].string if i > 0 else ''
+        following = tokens[i + 1].string if i + 1 < len(tokens) else ''
+        if previous == '.':
+            # Attribute name.
+            continue
+        if include_heads and following == '.':
+            # Leading name of a dotted attribute access.
+            names.add(name)
+            continue
+        if following == '.':
+            continue
+        if calls_only:
+            if following != '(':
+                continue
+        elif following == '=':
+            # Keyword argument name.
+            continue
+        names.add(name)
+    return names
