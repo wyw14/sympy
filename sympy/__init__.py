@@ -73,7 +73,7 @@ from .logic import (to_cnf, to_dnf, to_nnf, And, Or, Not, Xor, Nand, Nor,
         true, false, satisfiable)
 
 from .assumptions import (AppliedPredicate, Predicate, AssumptionsContext,
-        assuming, Q, ask, refine)
+        assuming, Q, ask, compare_assumptions, refine)
 
 from .polys import (Poly, PurePoly, poly_from_expr, parallel_poly_from_expr,
         degree, total_degree, degree_list, LC, LM, LT, pdiv, prem, pquo,
@@ -292,7 +292,7 @@ __all__ = [
 
     # sympy.assumptions
     'AppliedPredicate', 'Predicate', 'AssumptionsContext', 'assuming', 'Q',
-    'ask',  'refine',
+    'ask', 'compare_assumptions', 'refine',
 
     # sympy.polys
     'Poly', 'PurePoly', 'poly_from_expr', 'parallel_poly_from_expr', 'degree',
