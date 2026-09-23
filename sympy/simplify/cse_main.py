@@ -726,8 +726,116 @@ def tree_cse(exprs, symbols, opt_subs=None, order='canonical', ignore=()):
     return replacements, reduced_exprs
 
 
+def _iter_source_locations(expr, path=()):
+    """Yield ``(subexpr, path)`` pairs for ``expr`` and every structural
+    descendant. ``path`` is a tuple of argument indices, so that following
+    ``.args`` along it from ``expr`` recovers ``subexpr``. Entries of a
+    matrix are addressed by their ``(row, column)`` coordinates instead.
+    """
+    if isinstance(expr, MatrixBase):
+        # Mutable matrices are not hashable and cannot match a replacement
+        # expression; only their entries can be source locations.
+        for (row, col), entry in expr.todok().items():
+            if isinstance(entry, Basic):
+                yield from _iter_source_locations(entry, (row, col))
+        return
+
+    yield expr, path
+
+    if isinstance(expr, Basic):
+        for i, arg in enumerate(expr.args):
+            if isinstance(arg, Basic):
+                yield from _iter_source_locations(arg, path + (i,))
+
+
+def cse_sources(exprs, replacements):
+    """Map CSE replacement symbols to structural locations in the inputs.
+
+    Parameters
+    ==========
+
+    exprs : expression or iterable of expressions
+        The same input expressions that were passed to :func:`cse` (a
+        single expression is treated as a list of one). Matrices are
+        accepted, with entries addressed by ``(row, column)``.
+    replacements : iterable of ``(Symbol, expression)`` pairs
+        The replacements returned by :func:`cse`. They may be supplied in
+        any order.
+
+    Returns
+    =======
+
+    sources : dict
+        A mapping from each replacement symbol to a list of
+        ``(index, path)`` pairs. ``index`` is the position of the source
+        expression in ``exprs`` and ``path`` is a tuple of argument
+        indices selecting the subexpression within it; an empty path
+        refers to the whole expression. Paths are structural, hence they
+        do not depend on the printer used. Every occurrence is listed,
+        including occurrences shared between inputs, multiple occurrences
+        within one input and occurrences nested inside other eliminated
+        subexpressions, since nested replacement symbols are expanded
+        back to the input expressions. A symbol maps to an empty list if
+        its value is not a subexpression of any input, which can happen
+        when it was synthesized by the optimizer, e.g. by regrouping
+        arguments of an associative operation.
+
+    Examples
+    ========
+
+    >>> from sympy import cse, symbols
+    >>> from sympy.simplify.cse_main import cse_sources
+    >>> x0, x1 = symbols('x0 x1')
+    >>> from sympy.abc import x, y, z, w
+    >>> exprs = [(x + y)**2 + z, w*(x + y)**2, x + y + z]
+    >>> reps, reduced, sources = cse(exprs, sources=True)
+    >>> reps
+    [(x0, x + y), (x1, x0**2)]
+    >>> sources[x1]
+    [(0, (1,)), (1, (1,))]
+    >>> sources[x0]
+    [(0, (1, 0)), (1, (1, 0))]
+
+    In the third input ``x + y`` was regrouped out of ``x + y + z`` by
+    the optimizer rather than found as a subexpression, so it is not
+    listed there. The mapping stays valid when the replacements are
+    reordered:
+
+    >>> cse_sources(exprs, reversed(reps))[x0] == sources[x0]
+    True
+    """
+    if isinstance(exprs, (Basic, MatrixBase)):
+        exprs = [exprs]
+
+    # Expand each replacement into the subexpression it denotes in the
+    # original inputs. The replacements are topologically sorted first, so
+    # that reordering them beforehand does not affect the result.
+    expanded = {}
+    for sym, rhs in reps_toposort(list(replacements)):
+        for prev_sym in expanded:
+            if prev_sym in rhs.free_symbols:
+                rhs = rhs.subs(prev_sym, expanded[prev_sym])
+        expanded[sym] = rhs
+
+    targets = defaultdict(list)
+    for sym, subexpr in expanded.items():
+        targets[subexpr].append(sym)
+
+    sources = {sym: [] for sym in expanded}
+    for i, expr in enumerate(exprs):
+        if not isinstance(expr, (Basic, MatrixBase)):
+            continue
+        for subexpr, path in _iter_source_locations(expr):
+            for sym in targets.get(subexpr, ()):
+                sources[sym].append((i, path))
+
+    for locations in sources.values():
+        locations.sort()
+    return sources
+
+
 def cse(exprs, symbols=None, optimizations=None, postprocess=None,
-        order='canonical', ignore=(), list=True):
+        order='canonical', ignore=(), list=True, sources=False):
     """ Perform common subexpression elimination on an expression.
 
     Parameters
@@ -760,6 +868,11 @@ def cse(exprs, symbols=None, optimizations=None, postprocess=None,
         Substitutions containing any Symbol from ``ignore`` will be ignored.
     list : bool, (default True)
         Returns expression in list or else with same type as input (when False).
+    sources : bool, (default False)
+        If True, also return a dictionary mapping each replacement symbol
+        to the structural locations, given as ``(index, path)`` pairs, of
+        the subexpression in the input expressions. See
+        :func:`cse_sources` for details.
 
     Returns
     =======
@@ -770,11 +883,16 @@ def cse(exprs, symbols=None, optimizations=None, postprocess=None,
         list.
     reduced_exprs : list of SymPy expressions
         The reduced expressions with all of the replacements above.
+    sources : dict
+        Only returned when ``sources=True``. The structural source
+        locations of each replacement symbol, as returned by
+        :func:`cse_sources`.
 
     Examples
     ========
 
-    >>> from sympy import cse, SparseMatrix
+    >>> from sympy import cse, SparseMatrix, symbols
+    >>> x0 = symbols('x0')
     >>> from sympy.abc import x, y, z, w
     >>> cse(((w + x + y + z)*(w + y + z))/(w + x)**3)
     ([(x0, y + z), (x1, w + x)], [(w + x0)*(x0 + x1)/x1**3])
@@ -805,11 +923,22 @@ def cse(exprs, symbols=None, optimizations=None, postprocess=None,
     ([], [x])
     >>> cse(x, list=False)
     ([], x)
+
+    With ``sources=True``, the structural locations of every replacement
+    within the input expressions are returned as well:
+
+    >>> reps, reduced, sources = cse(
+    ...     [(x + y)**2 + z, (x + y)*z], sources=True)
+    >>> reps
+    [(x0, x + y)]
+    >>> sources[x0]
+    [(0, (1, 0)), (1, (1,))]
     """
     if not list:
         return _cse_homogeneous(exprs,
             symbols=symbols, optimizations=optimizations,
-            postprocess=postprocess, order=order, ignore=ignore)
+            postprocess=postprocess, order=order, ignore=ignore,
+            sources=sources)
 
     if isinstance(exprs, (int, float)):
         exprs = sympify(exprs)
@@ -859,6 +988,10 @@ def cse(exprs, symbols=None, optimizations=None, postprocess=None,
     reduced_exprs = [postprocess_for_cse(e, optimizations)
                      for e in reduced_exprs]
 
+    # Locate every replacement within the original input expressions.
+    if sources:
+        source_map = cse_sources(exprs, replacements)
+
     # Get the matrices back
     for i, e in enumerate(exprs):
         if isinstance(e, (Matrix, ImmutableMatrix)):
@@ -873,10 +1006,15 @@ def cse(exprs, symbols=None, optimizations=None, postprocess=None,
                 m = m.as_immutable()
             reduced_exprs[i] = m
 
-    if postprocess is None:
-        return replacements, reduced_exprs
+    if not sources:
+        if postprocess is None:
+            return replacements, reduced_exprs
+        return postprocess(replacements, reduced_exprs)
 
-    return postprocess(replacements, reduced_exprs)
+    if postprocess is not None:
+        replacements, reduced_exprs = postprocess(replacements,
+                                                  reduced_exprs)
+    return replacements, reduced_exprs, source_map
 
 
 def _cse_homogeneous(exprs, **kwargs):
@@ -900,6 +1038,9 @@ def _cse_homogeneous(exprs, **kwargs):
         list.
     reduced_exprs : list of SymPy expressions
         The reduced expressions with all of the replacements above.
+    sources : dict
+        Only returned when ``sources=True`` is passed. The structural
+        source locations of each replacement symbol.
 
     Examples
     ========
@@ -925,22 +1066,31 @@ def _cse_homogeneous(exprs, **kwargs):
     >>> output({1, x})
     <class 'set'>
     """
-    if isinstance(exprs, str):
-        replacements, reduced_exprs = _cse_homogeneous(
-            sympify(exprs), **kwargs)
-        return replacements, repr(reduced_exprs)
-    if isinstance(exprs, (list, tuple, set)):
-        replacements, reduced_exprs = cse(exprs, **kwargs)
-        return replacements, type(exprs)(reduced_exprs)
-    if isinstance(exprs, dict):
-        keys = list(exprs.keys()) # In order to guarantee the order of the elements.
-        replacements, values = cse([exprs[k] for k in keys], **kwargs)
-        reduced_exprs = dict(zip(keys, values))
+    want_sources = kwargs.pop('sources', False)
+    kwargs['sources'] = True
+
+    def finish(replacements, reduced_exprs, sources):
+        if want_sources:
+            return replacements, reduced_exprs, sources
         return replacements, reduced_exprs
 
+    if isinstance(exprs, str):
+        replacements, reduced_exprs, sources = _cse_homogeneous(
+            sympify(exprs), **kwargs)
+        return finish(replacements, repr(reduced_exprs), sources)
+    if isinstance(exprs, (list, tuple, set)):
+        replacements, reduced_exprs, sources = cse(exprs, **kwargs)
+        return finish(replacements, type(exprs)(reduced_exprs), sources)
+    if isinstance(exprs, dict):
+        keys = list(exprs.keys()) # In order to guarantee the order of the elements.
+        replacements, values, sources = cse(
+            [exprs[k] for k in keys], **kwargs)
+        reduced_exprs = dict(zip(keys, values))
+        return finish(replacements, reduced_exprs, sources)
+
     try:
-        replacements, (reduced_exprs,) = cse(exprs, **kwargs)
+        replacements, (reduced_exprs,), sources = cse(exprs, **kwargs)
     except TypeError: # For example 'mpf' objects
-        return [], exprs
+        return finish([], exprs, {})
     else:
-        return replacements, reduced_exprs
+        return finish(replacements, reduced_exprs, sources)

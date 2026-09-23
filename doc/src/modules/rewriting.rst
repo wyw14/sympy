@@ -107,3 +107,6 @@ More information:
 
 .. autofunction:: cse
    :noindex:
+
+.. autofunction:: cse_sources
+   :noindex:

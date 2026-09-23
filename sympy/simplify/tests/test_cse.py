@@ -22,7 +22,7 @@ from sympy.matrices.dense import Matrix
 from sympy.matrices.expressions import Inverse, MatAdd, MatMul, Transpose
 from sympy.polys.rootoftools import CRootOf
 from sympy.series.order import O
-from sympy.simplify.cse_main import cse
+from sympy.simplify.cse_main import cse, cse_sources
 from sympy.simplify.simplify import signsimp
 from sympy.tensor.indexed import (Idx, IndexedBase)
 
@@ -760,3 +760,109 @@ def test_cse_matrix_kalman_filter():
         MatAdd(Sigma, MatMul(S.NegativeOne, Sigma, x0, x1, H, Sigma)),
     ]
     assert cse_expr == (replacements_expected, reduced_exprs_expected)
+
+
+def _follow_path(expr, path):
+    """Follow a cse_sources path; matrix paths start with (row, column)."""
+    if isinstance(expr, (MutableDenseMatrix, MutableSparseMatrix)):
+        expr = expr[path[0], path[1]]
+        path = path[2:]
+    for index in path:
+        expr = expr.args[index]
+    return expr
+
+
+def _expanded_replacements(replacements):
+    expanded = {}
+    for sym, rhs in replacements:
+        for prev_sym, prev_expr in expanded.items():
+            if prev_sym in rhs.free_symbols:
+                rhs = rhs.subs(prev_sym, prev_expr)
+        expanded[sym] = rhs
+    return expanded
+
+
+def _assert_sources_valid(exprs, replacements, sources):
+    expanded = _expanded_replacements(replacements)
+    assert set(sources) == set(expanded)
+    for sym, locations in sources.items():
+        assert locations == sorted(locations)
+        for index, path in locations:
+            assert isinstance(path, tuple)
+            assert all(isinstance(i, int) for i in path)
+            assert _follow_path(exprs[index], path) == expanded[sym]
+
+
+def test_cse_sources_shared_nested_and_repeated():
+    exprs = [(x + y)**2 + z, w*(x + y)**2, x + y + z]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert replacements == [(x0, x + y), (x1, x0**2)]
+    assert sources[x0] == [(0, (1, 0)), (1, (1, 0))]
+    assert sources[x1] == [(0, (1,)), (1, (1,))]
+    _assert_sources_valid(exprs, replacements, sources)
+
+    exprs = [sqrt(x + y) + (x + y)**2]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert replacements == [(x0, x + y)]
+    assert sources[x0] == [(0, (0, 0)), (0, (1, 0))]
+    _assert_sources_valid(exprs, replacements, sources)
+
+    exprs = [(x + y)**2, (x + y)**2 + z]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert replacements == [(x0, (x + y)**2)]
+    assert sources[x0] == [(0, ()), (1, (1,))]
+    _assert_sources_valid(exprs, replacements, sources)
+
+
+def test_cse_sources_regrouped_replacement():
+    # x + y is regrouped out of x + y + z even though it is not a
+    # subexpression of it, so no structural source can be reported.
+    exprs = [x + y + z, w + x + y]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert replacements == [(x0, x + y)]
+    assert sources[x0] == []
+
+
+def test_cse_sources_reorder_invariant():
+    exprs = [(x + y)**2 + z, w*(x + y)**2, x + y + z]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert cse_sources(exprs, reversed(replacements)) == sources
+
+    single_replacements, reduced, single_sources = cse(
+        exprs[0], sources=True)
+    assert cse_sources(exprs[0], single_replacements) == single_sources
+
+
+def test_cse_sources_matrices():
+    exprs = [MutableDenseMatrix([[x + y, x + y], [z, 0]])]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert isinstance(reduced[0], MutableDenseMatrix)
+    assert sources[x0] == [(0, (0, 0)), (0, (0, 1))]
+    _assert_sources_valid(exprs, replacements, sources)
+
+    exprs = [MutableSparseMatrix([[x + y, x + y], [z, 0]])]
+    replacements, reduced, sources = cse(exprs, sources=True)
+    assert isinstance(reduced[0], MutableSparseMatrix)
+    assert sources[x0] == [(0, (0, 0)), (0, (0, 1))]
+    _assert_sources_valid(exprs, replacements, sources)
+
+
+def test_cse_sources_homogeneous_and_default():
+    # Without the flag the return value is still a 2-tuple.
+    assert len(cse([(x + y)**2, x + y])) == 2
+
+    replacements, reduced, sources = cse(
+        [(x + y)**2, x + y], list=False, sources=True)
+    assert isinstance(reduced, list)
+    assert sources[x0] == [(0, (0,)), (1, ())]
+
+    replacements, reduced, sources = cse(
+        {'a': (x + y)**2, 'b': x + y}, list=False, sources=True)
+    assert isinstance(reduced, dict)
+    assert sources[x0] == [(0, (0,)), (1, ())]
+
+    replacements, reduced, sources = cse(
+        sqrt(x + y) + (x + y)**2, list=False, sources=True)
+    assert sources[x0] == [(0, (0, 0)), (0, (1, 0))]
+
+    assert cse([x + y], sources=True) == ([], [x + y], {})

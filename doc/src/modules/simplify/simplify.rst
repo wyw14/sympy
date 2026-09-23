@@ -70,6 +70,8 @@ Simplify
 
 .. autofunction:: cse
 
+.. autofunction:: cse_sources
+
 .. autofunction:: sympy.simplify.cse_main::opt_cse
 
 .. autofunction:: sympy.simplify.cse_main::tree_cse
